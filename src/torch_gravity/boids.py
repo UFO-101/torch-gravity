@@ -10,13 +10,14 @@ import numpy as np
 import torch
 from IPython.display import Video, display
 from PIL import Image, ImageDraw
+from tqdm import tqdm
 
 
 @contextmanager
 def timer(name: str):
     t0 = time.perf_counter()
     yield
-    print(f"{name:18s}: {time.perf_counter() - t0:6.3f}s")
+    print(f"{name:22s}: {time.perf_counter() - t0:6.3f}s")
 
 
 DEV = "mps" if torch.backends.mps.is_available() else "cpu"
@@ -28,7 +29,7 @@ RGB_Int = Tuple[int, int, int]
 _disc_cache: dict[int, np.ndarray] = {}
 
 
-def disc_sprite(px_r: int) -> np.ndarray:  # uint8 mask
+def disc_sprite(px_r: int) -> np.ndarray:
     if px_r in _disc_cache:
         return _disc_cache[px_r]
     d = px_r * 2
@@ -40,7 +41,7 @@ def disc_sprite(px_r: int) -> np.ndarray:  # uint8 mask
 
 # ───────────────────────── fast renderer ────────────────────────────────────
 def render_frame_fast(
-    pos: torch.Tensor,  # [N,2] (device→CPU inside)
+    pos: torch.Tensor,
     r: Sequence[float] | torch.Tensor,
     rgb: Sequence[RGB_Int] | torch.Tensor,
     vel: torch.Tensor | None,
@@ -65,16 +66,16 @@ def render_frame_fast(
     rgb_np = (
         torch.as_tensor(rgb).detach().cpu().numpy()
         if isinstance(rgb, torch.Tensor)
-        else np.asarray(rgb, dtype=np.uint8)
+        else np.asarray(rgb, np.uint8)
     )
 
-    # --- discs --------------------------------------------------------------
+    # discs -------------------------------------------------------------
     for (x, y), rad, col in zip(pos_np, r_np, rgb_np):
         px_r = max(1, int(rad * sx))
         sprite = disc_sprite(px_r)
         d = px_r * 2
         cx = int((x - xmin) * sx)
-        cy = int((ymax - y) * sy)  # y‑flip
+        cy = int((ymax - y) * sy)
         x0, y0 = cx - px_r, cy - px_r
         x1, y1 = x0 + d, y0 + d
         sx0 = max(0, -x0)
@@ -87,20 +88,19 @@ def render_frame_fast(
         alpha = sprite[sy0:sy1, sx0:sx1, None] / 255.0
         patch[:] = (alpha * col + (1 - alpha) * patch).astype(np.uint8)
 
-    # --- velocity arrows ----------------------------------------------------
+    # arrows ------------------------------------------------------------
     if vel is not None:
         img = Image.fromarray(canvas)
         draw = ImageDraw.Draw(img, "RGBA")
         vel_np = vel.detach().cpu().numpy()
         for (x, y), v, rad in zip(pos_np, vel_np, r_np):
-            norm = np.linalg.norm(v)
-            if norm < 1e-6:
-                continue  # skip stagnating
-            u = v / norm
-            # pixel‑space unit vector (note y flip)
+            n = np.linalg.norm(v)
+            0 if n < 1e-6 else None
+            u = v / n
             ux, uy = u[0] * sx, -u[1] * sy
-            mag = np.sqrt(ux * ux + uy * uy)
-            ux, uy = ux / mag, uy / mag
+            mag = (ux**2 + uy**2) ** 0.5
+            ux /= mag
+            uy /= mag
             px_r = max(1, int(rad * sx))
             diam = 2 * px_r * (1 - edge_margin)
             tail = (
@@ -111,10 +111,8 @@ def render_frame_fast(
                 (x - xmin) * sx + ux * diam * 0.5,
                 (ymax - y) * sy + uy * diam * 0.5,
             )
-            # shaft
             w_line = max(1, int(px_r * shaft_width_frac))
             draw.line([tail, head], fill=(255, 255, 255, 230), width=w_line)
-            # triangular head
             h_len = diam * head_frac
             h_wid = px_r * head_width_frac
             p1 = head
@@ -137,20 +135,22 @@ def video_from_frames(frames: List[np.ndarray], fps=30, path=None) -> Video:
 def default_params(**kw) -> Dict[str, float]:
     p = dict(
         dt=0.03,
-        neighbor_dist=4.2,
-        separation_dist=0.15,
-        cohesion_weight=3.5,
-        alignment_weight=10.0,
-        separation_weight=1.2,
-        max_speed=1.0,
-        max_force=0.50,
-        world_half_size=2.5,
+        neighbor_dist=2.0,  #  ← your new numbers
+        separation_dist=0.2,
+        cohesion_weight=5.5,
+        alignment_weight=5.0,
+        separation_weight=20.2,
+        max_speed=1.3,
+        max_force=2.90,
+        world_half_size=8,
     )
     p.update(kw)
     return p
 
 
-def step(s: Dict[str, torch.Tensor], p: Dict[str, float]) -> Dict[str, torch.Tensor]:
+def step(
+    s: Dict[str, torch.Tensor], p: Dict[str, float], *, wrap: bool = True
+) -> Dict[str, torch.Tensor]:
     pos, vel = s["pos"], s["vel"]
     dt, vmax, fmax = p["dt"], p["max_speed"], p["max_force"]
     nd, sd = p["neighbor_dist"], p["separation_dist"]
@@ -171,51 +171,150 @@ def step(s: Dict[str, torch.Tensor], p: Dict[str, float]) -> Dict[str, torch.Ten
     vel = vel + acc * dt
     vel = vel / vel.norm(dim=1, keepdim=True).clamp(min=1e-12) * vmax
     pos = pos + vel * dt
-    half = p["world_half_size"]
-    pos = (pos + half) % (2 * half) - half
+    if wrap:
+        half = p["world_half_size"]
+        pos = (pos + half) % (2 * half) - half
     return {"pos": pos, "vel": vel, "r": s["r"], "rgb": s["rgb"]}
 
 
-def rollout(init, p, steps):
-    traj = [init]
+def rollout(init, p, steps, warmup=0):
+    """Run `warmup` steps (discarded) then `steps` steps (returned incl. start)."""
+    state = init
+    for _ in range(warmup):  # burn‑in
+        state = step(state, p)
+    traj = [state]
     for _ in range(steps):
-        traj.append(step(traj[-1], p))
+        state = step(state, p)
+        traj.append(state)
     return traj
 
 
+def ring_loss(
+    final_pos: torch.Tensor, centre: torch.Tensor, radius: float
+) -> torch.Tensor:
+    """
+    Mean‑squared radial error:  (‖x - c‖₂ - R)², averaged over boids.
+    """
+    r = (final_pos - centre).norm(dim=1)
+    return ((r - radius) ** 2).mean()
+
+
+def warmup_state(
+    state: Dict[str, torch.Tensor], p: Dict[str, float], warm_steps: int, device="cpu"
+) -> Dict[str, torch.Tensor]:
+    """Run `warm_steps` with wrapping ON – returns the *final* state (no grads)."""
+    s = {k: v.clone().to(device) for k, v in state.items()}
+    for _ in range(warm_steps):
+        s = step(s, p, wrap=True)
+    # detach everything
+    for k in ("pos", "vel"):
+        s[k] = s[k].detach()
+    return s
+
+
+def optimise_vel_to_ring(
+    state0: Dict[str, torch.Tensor],
+    p: Dict[str, float],
+    *,
+    steps: int = 400,
+    R: float = 1.7,
+    lr: float = 0.2,
+    iters: int = 800,
+    device="cpu",
+    window: Tuple[float, float, float, float],
+    render_every: int = 10,
+) -> Dict[str, torch.Tensor]:
+    """
+    Given a *warmed* state, adjust ONLY the initial velocities so that
+    after `steps` frames (no wrapping) the flock sits on a ring of radius `R`.
+    Returns the modified initial state (positions unchanged).
+    """
+    state = {k: v.clone().to(device) for k, v in state0.items()}
+    state["vel"].requires_grad_()
+
+    opt = torch.optim.Adam([state["vel"]], lr=lr)
+    centre = state["pos"].mean(0).detach()
+
+    for it in (pbar := tqdm(range(iters), desc="optimising velocities")):
+        s = state
+        for _ in range(steps):
+            s = step(s, p, wrap=False)  # smooth gradient path
+        loss = ring_loss(s["pos"], centre, R)
+
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+
+        # keep within max_speed for physical plausibility
+        with torch.no_grad():
+            speed = state["vel"].norm(dim=1, keepdim=True).clamp(min=1e-12)
+            state["vel"].mul_(p["max_speed"] / speed)
+
+        if it % render_every == 0:
+            frame = render_frame_fast(
+                s["pos"],
+                s["r"],
+                s["rgb"],
+                s["vel"],
+                size=(1024, 1024),
+                bg=(0, 0, 0),
+                window=window,
+            )
+            display(Image.fromarray(frame))
+
+        pbar.set_postfix(loss=loss.item())
+
+    # freeze grads before returning
+    state["vel"] = state["vel"].detach()
+    return state
+
+
 # ───────────────────────── demo & timings ───────────────────────────────────
-torch.manual_seed(0)
-N, STEPS = 50, 400
-state0 = {
-    "pos": (torch.rand(N, 2, device=DEV) * 5 - 2.5),
-    "vel": torch.randn(N, 2, device=DEV),
-    "r": torch.full((N,), 0.12),  # CPU tensors for sprites
+# # choose raw random start (pos only, zero vel for clarity) -------------------
+N = 400
+state_raw = {
+    "pos": (torch.rand(N, 2, device=DEV) * 4 - 2),
+    "vel": torch.zeros(N, 2, device=DEV),
+    "r": torch.full((N,), 0.08),
     "rgb": torch.randint(0, 256, (N, 3), dtype=torch.uint8),
 }
 p = default_params()
-_ = step(state0, p)  # JIT warm‑up
-
-with timer("simulation"):
-    traj = rollout(state0, p, STEPS)
-
 half = p["world_half_size"]
 window = (-half, half, -half, half)
 
-with timer("rendering (Pillow)"):
-    frames = [
-        render_frame_fast(
-            s["pos"],
-            s["r"],
-            s["rgb"],
-            s["vel"],
-            size=(512, 512),
-            bg=(250, 250, 250),
-            window=window,
-        )
-        for s in traj
-    ]
+# 1. burn‑in to get a plausible configuration -------------------------------
+WARM_STEPS = 1000
+with timer("warm‑up only"):
+    state_warm = warmup_state(state_raw, p, warm_steps=WARM_STEPS, device=DEV)
 
-with timer("encoding"):
-    vid = video_from_frames(frames, fps=30)
+# 2. optimise just the *velocities* -----------------------------------------
+RENDER_STEPS = 100
+with timer("optimisation"):
+    state_star = optimise_vel_to_ring(
+        state_warm,
+        p,
+        steps=RENDER_STEPS,
+        R=1.7,
+        lr=0.4,
+        iters=100,
+        device=DEV,
+        window=window,
+    )
 
-display(vid)
+# 3. run the normal rollout (NO warmup now) ----------------------------------
+traj = rollout(state_star, p, steps=RENDER_STEPS, warmup=0)
+
+# 4. render as usual ---------------------------------------------------------
+frames = [
+    render_frame_fast(
+        s["pos"],
+        s["r"],
+        s["rgb"],
+        s["vel"],
+        size=(1024, 1024),
+        bg=(0, 0, 0),
+        window=window,
+    )
+    for s in traj
+]
+display(video_from_frames(frames, fps=30))
